@@ -66,6 +66,13 @@
 ### ③ Python
 - Python 3.10+。
 
+### ④ 注册 Gmail / 谷歌邮箱时的 Android 环境（按需）
+- BlueStacks：用于运行 Gmail Android App，建议使用固定版本；Release 包可选择附带安装器。
+- Android Studio 或 Android SDK Platform Tools：至少需要 `adb` 可用。只安装 `platform-tools` 也可以，不强制完整安装 Android Studio。
+- Node.js 20+、Appium 2.x、Appium UiAutomator2 driver：用于驱动 Android UI 自动化。
+- 模拟器内需要安装 Gmail App，并开启 BlueStacks ADB，默认连接地址为 `127.0.0.1:5675`。
+- 相关脚本在 `gmail_android/scripts/` 下；小体积 zip 只包含代码和安装脚本，不包含 BlueStacks / Android SDK / Node / Appium 等大二进制。
+
 ---
 
 ## 2. 安装

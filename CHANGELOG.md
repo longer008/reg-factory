@@ -14,6 +14,7 @@
 - 根 `requirements.txt` 增加 `Appium-Python-Client` 和 `selenium`。
 - 根 README 增加 Gmail Android 安装包的安装、配置、运行和 Release 打包说明。
 - README 补充 GitHub Release 安装包上传流程，覆盖网页上传和 `gh release` 命令两种方式。
+- 根 README 前置条件补充 Gmail/谷歌邮箱注册所需的 BlueStacks、Android SDK/ADB、Node/Appium 和 Gmail App。
 
 **安全边界**
 - Gmail 手机/SMS/CAPTCHA 和 Google 额外安全验证默认由人工完成；脚本支持 `--resume-after-phone` 续跑。
