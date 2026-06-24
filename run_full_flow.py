@@ -166,6 +166,12 @@ def stage_platforms(args, env, email, password):
         cmd.append("--keep-on-fail")
     if args.import_c2a:
         cmd.append("--import-c2a")  # 透传给 register_three_platforms -> register_chatgpt
+    if args.codex:
+        cmd.append("--codex")  # 透传给 register_three_platforms -> register_chatgpt
+        if args.codex_group:
+            cmd += ["--codex-group", args.codex_group]
+        if args.codex_manual_phone:
+            cmd.append("--codex-manual-phone")
     log(f"Stage B cmd: {' '.join(cmd)}", "B")
     if args.dry_run:
         return 0
@@ -226,6 +232,12 @@ def main():
     ap.add_argument("--keep-on-fail", action="store_true")
     ap.add_argument("--import-c2a", action="store_true",
                     help="chatgpt 注册成功后即时把 token 导入 chatgpt2api（透传到底层 register_chatgpt.py）")
+    ap.add_argument("--codex", action="store_true",
+                    help="chatgpt 注册成功后走 Codex OAuth 提取 rt 导入 SUB2API（透传到底层 register_chatgpt.py）")
+    ap.add_argument("--codex-group", default=None,
+                    help="SUB2API 目标分组名（透传，默认取 config.SUB2API_GROUP）")
+    ap.add_argument("--codex-manual-phone", action="store_true",
+                    help="Codex add-phone 手动模式：不接码，自己在浏览器填号收码（透传）")
     # 基建
     ap.add_argument("--proxy", default=PROXY_DEFAULT, help="HTTP(S)_PROXY；传空串禁用")
     ap.add_argument("--clash-api", default=CLASH_API_DEFAULT)

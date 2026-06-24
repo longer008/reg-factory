@@ -101,20 +101,48 @@ def init_clash():
     return client, group
 
 
+# Clash 节点轮换排除名单：国内直连/大陆节点从中国 IP 出口，Outlook(MS PerimeterX)
+# 对中国 IP 的按住验证基本必挂，且轮到它纯浪费一次 attempt，故从 GLOBAL 轮换里剔除。
+# 子串匹配（节点名含任一即排除）。可经 CLASH_EXCLUDE_NODES 环境变量追加（逗号分隔）。
+_CN_EXCLUDE_HINTS = ("国内直连", "直连", "DIRECT", "大陆", "国内", "China", "回国")
+
+
+def _rotate_excluded(client, group):
+    """把 CN/直连子串提示解析成 GLOBAL 组里真实节点名集合（pick_node 用精确匹配，
+    故必须先列出实际节点名再按子串挑出要排除的）。CLASH_EXCLUDE_NODES 追加精确名。"""
+    ex = set()
+    extra = (os.environ.get("CLASH_EXCLUDE_NODES") or "").strip()
+    if extra:
+        ex |= {x.strip() for x in extra.replace("，", ",").split(",") if x.strip()}
+    try:
+        for name in client.list_nodes(group):
+            if any(h in name for h in _CN_EXCLUDE_HINTS):
+                ex.add(name)
+    except Exception as e:
+        log(f"resolve excluded nodes err: {type(e).__name__}: {e}", "WARN")
+    return ex
+
+
 def maybe_rotate(client, group, strategy="round_robin", max_latency_ms=6000,
                  mixed_port=7897):
     """Rotate to a fresh Clash node and verify egress IP actually changed.
     Uses rotate_with_verify which recurses into nested selector groups when
     the outer switch hits another group (e.g. GLOBAL -> 📲 Telegram is just
-    another selector, not a real node)."""
+    another selector, not a real node).
+
+    排除国内直连/大陆节点（见 _CN_EXCLUDE_HINTS）：中国 IP 注册 Outlook 基本必挂。"""
     if client is None or not group:
         return None
     try:
+        excluded = _rotate_excluded(client, group)
+        if excluded:
+            log(f"clash rotate excluding CN/direct nodes: {sorted(excluded)}")
         info = _clash_verge.rotate_with_verify(
             client, group, strategy=strategy,
             max_latency_ms=max_latency_ms,
             mixed_port=mixed_port,
             settle_sec=1.5,
+            excluded=excluded,
         )
         if info.get("ip_changed"):
             log(f"clash IP {info.get('ip_before')} -> {info.get('ip_after')} (group={info.get('group')})")
@@ -245,6 +273,44 @@ def write_record(record):
     return fname
 
 
+async def _run_outlook_on_ctx(mod, ctx, idx):
+    """Scrub residual state -> 新页注册 -> 导出 outlook 相关 cookie。"""
+    # Scrub Chromium residual state so signup.live.com doesn't see a
+    # stale identity from a previous session.
+    try:
+        await ctx.clear_cookies()
+        for _pg in ctx.pages:
+            try:
+                c = await ctx.new_cdp_session(_pg)
+                await c.send("Network.clearBrowserCookies")
+                await c.send("Network.clearBrowserCache")
+                try: await c.detach()
+                except Exception: pass
+                break
+            except Exception:
+                pass
+    except Exception:
+        pass
+    page = await ctx.new_page()
+    email, password = await mod.register_outlook(page, ctx, idx)
+    cookies = []
+    if email:
+        try:
+            all_cookies = await ctx.cookies()
+            keep_domains = (
+                "outlook.", "live.com", "microsoftonline.",
+                "microsoft.com", "office.com", ".office365.",
+                "msn.com", "bing.com", "mail.live.com",
+            )
+            cookies = [
+                c for c in all_cookies
+                if any(d in (c.get("domain") or "") for d in keep_domains)
+            ]
+        except Exception as e:
+            log(f"cookie export failed: {e}", "WARN")
+    return email, password, cookies
+
+
 async def one_attempt(mod, proxy_str, idx):
     """Mirrors bs_register_step1.fetch_email_from_self_register's inline
     flow, but doesn't carry the breaker state — we're a dedicated loop and
@@ -282,39 +348,7 @@ async def one_attempt(mod, proxy_str, idx):
         async with _apw() as p:
             browser = await p.chromium.connect_over_cdp(ws)
             ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-            # Scrub Chromium residual state so signup.live.com doesn't see a
-            # stale identity from a previous session.
-            try:
-                await ctx.clear_cookies()
-                for _pg in ctx.pages:
-                    try:
-                        c = await ctx.new_cdp_session(_pg)
-                        await c.send("Network.clearBrowserCookies")
-                        await c.send("Network.clearBrowserCache")
-                        try: await c.detach()
-                        except Exception: pass
-                        break
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            page = await ctx.new_page()
-            email, password = await mod.register_outlook(page, ctx, idx)
-            cookies = []
-            if email:
-                try:
-                    all_cookies = await ctx.cookies()
-                    keep_domains = (
-                        "outlook.", "live.com", "microsoftonline.",
-                        "microsoft.com", "office.com", ".office365.",
-                        "msn.com", "bing.com", "mail.live.com",
-                    )
-                    cookies = [
-                        c for c in all_cookies
-                        if any(d in (c.get("domain") or "") for d in keep_domains)
-                    ]
-                except Exception as e:
-                    log(f"cookie export failed: {e}", "WARN")
+            email, password, cookies = await _run_outlook_on_ctx(mod, ctx, idx)
         return email, password, cookies
     finally:
         if profile_id:

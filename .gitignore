@@ -39,6 +39,11 @@ recordings/
 *.log
 claude_node_usage.txt
 
+# 本地调试/运行期门控脚本与代理清单（不进库）
+codex_gated_launch.sh
+proxies_clash.txt
+oauth_authorize_dump.html
+
 # Gmail Android release/offline binary payloads
 gmail_android/offline/bluestacks/*
 !gmail_android/offline/bluestacks/.gitkeep

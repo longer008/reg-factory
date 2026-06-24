@@ -33,6 +33,14 @@ try:
 except Exception:
     CHATGPT2API_URL, CHATGPT2API_KEY = "", ""
 
+try:
+    from config import (SUB2API_URL, SUB2API_EMAIL, SUB2API_PASSWORD, SUB2API_GROUP,
+                        CPA_URL, CPA_MGMT_KEY)
+except Exception:
+    SUB2API_URL = SUB2API_EMAIL = SUB2API_PASSWORD = ""
+    SUB2API_GROUP = "codex"
+    CPA_URL = CPA_MGMT_KEY = ""
+
 PLATFORM = "chatgpt"
 SIGNUP_URL = "https://chatgpt.com/auth/login"
 KEY_COOKIES = ["__Secure-next-auth.session-token", "__Secure-next-auth.session-token.0"]
@@ -45,6 +53,79 @@ FIXED_CLIENT_ID = None
 IMPORT_C2A = False  # 注册成功后即时把 token 导入 chatgpt2api（--import-c2a 开启）
 C2A_URL = None  # chatgpt2api host（默认取 config.CHATGPT2API_URL）
 C2A_KEY = None  # chatgpt2api admin key（默认取 config.CHATGPT2API_KEY）
+EXTRACT_CODEX = False  # 注册成功后顺手走 Codex OAuth 提取 rt 导入 SUB2API（--codex 开启）
+CODEX_GROUP = None  # SUB2API 目标分组（默认取 config.SUB2API_GROUP）
+CODEX_MANUAL_PHONE = False  # add-phone 手动模式（不接码，自己在浏览器填号收码）
+CODEX_TIMEOUT = 120  # Codex 授权捕获超时秒
+
+
+# CF 友好节点池：ChatGPT 注册页对宿主出口 IP 敏感，AWS 机房 + 部分中转 IP(如 216.195.209.x)
+# 会被 Cloudflare 全页 Turnstile 拦(body 空)。这些 188.253.x 的 NF 节点实测能静默放行。
+# 可经环境变量 CHATGPT_CF_NODES 覆盖(逗号分隔精确节点名)。检测到 CF 拦截就轮换到下一个。
+import os as _os
+_DEFAULT_CF_NODES = ["level1-日本01-NF", "level1-日本02-NF", "level1-新加坡01-NF",
+                     "level1-新加坡02-NF", "level1-韩国01", "level1-法国01"]
+CF_NODES = [n.strip() for n in (_os.environ.get("CHATGPT_CF_NODES") or "").split(",") if n.strip()] or _DEFAULT_CF_NODES
+_cf_node_idx = [0]  # 轮换游标
+
+
+async def _is_cf_blocked(page):
+    """CF 全页拦截判定：无 email 输入框 且 (页面只有 cf-turnstile 隐藏域 / body 基本空)。"""
+    try:
+        if await page.locator('input[type="email"], input[name="email"]').count() > 0:
+            return False
+        body = (await page.locator("body").inner_text()).strip()
+        has_ts = await page.locator('input[name="cf-turnstile-response"], .cf-turnstile, iframe[src*=challenges.cloudflare]').count() > 0
+        return has_ts or len(body) < 5
+    except Exception:
+        # reload 中 locator 抛 DOMException：当作仍被拦(还在挑战页)
+        return True
+
+
+async def _click_turnstile(page):
+    """尝试点 Turnstile 勾选框（临界 IP 上会降级成可点的 'Verify you are human'）。
+    iframe 内 checkbox 优先；不行就按容器坐标点。点到返回 True（不保证过，过没过由调用方轮询判定）。"""
+    # 1) challenges.cloudflare iframe 内的 checkbox/label
+    for sel in ('iframe[src*=challenges.cloudflare]', 'iframe[src*=turnstile]'):
+        try:
+            if await page.locator(sel).count() > 0:
+                fr = page.frame_locator(sel).first
+                for inner in ('input[type=checkbox]', 'label', 'body'):
+                    loc = fr.locator(inner)
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=3000)
+                        return True
+        except Exception:
+            pass
+    # 2) .cf-turnstile 容器左侧勾选框位置（容器内偏左中部）
+    try:
+        if await page.locator('.cf-turnstile').count() > 0:
+            box = await page.locator('.cf-turnstile').first.bounding_box()
+            if box:
+                await page.mouse.click(box["x"] + 28, box["y"] + box["height"] / 2)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _switch_cf_node():
+    """把 Clash GLOBAL 切到下一个 CF 友好节点并断连接换出口。返回切到的节点名或 None。"""
+    try:
+        import _clash_verge as cv
+        api = _os.environ.get("CLASH_API", "http://127.0.0.1:9097")
+        secret = _os.environ.get("CLASH_SECRET", "")
+        group = _os.environ.get("CLASH_GROUP", "GLOBAL") or "GLOBAL"
+        client = cv.ClashClient(api, secret)
+        node = CF_NODES[_cf_node_idx[0] % len(CF_NODES)]
+        _cf_node_idx[0] += 1
+        client.switch(group, node)
+        client.close_connections()
+        return node
+    except Exception as e:
+        print(f"  [cf] 切节点失败: {str(e)[:80]}")
+        return None
+
 
 # OpenAI 发件人 / 验证码邮件特征
 OAI_SENDER = ("openai.com", "noreply@", "no-reply@")
@@ -140,6 +221,31 @@ _COOKIE_BTNS = [
 ]
 
 
+async def _click_resend_code(page):
+    """验证码页找「重新发送」入口点一下（多语言）。点到返回 True。"""
+    labels = ["Resend code", "Resend email", "Resend", "Send again", "Send a new code",
+              "再送信", "再送", "コードを再送", "重新发送", "重新發送", "重发",
+              "重新傳送電郵", "重新传送电邮", "重新傳送", "重新传送", "重新傳送驗證碼", "重新獲取",
+              "Kirim semula", "Hantar semula"]
+    for lbl in labels:
+        for getter in (
+            lambda l=lbl: page.get_by_role("button", name=l, exact=False),
+            lambda l=lbl: page.get_by_role("link", name=l, exact=False),
+            lambda l=lbl: page.locator(f'button:has-text("{l}")'),
+            lambda l=lbl: page.locator(f'a:has-text("{l}")'),
+        ):
+            try:
+                loc = getter()
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=3000)
+                    print(f"  [4] resend clicked（匹配 '{lbl}'）")
+                    await asyncio.sleep(2)
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 async def dismiss_cookie_banner(page):
     """关闭 cookie 同意横幅（命中一个即可）。"""
     for label in _COOKIE_BTNS:
@@ -218,6 +324,108 @@ def import_chatgpt2api(session, email):
         print(f"  [c2a] 导入失败: {str(e)[:120]}")
 
 
+async def extract_codex(page, email, p=None, ctx=None):
+    """注册成功后顺手走 Codex OAuth 提取 refresh_token 导入 SUB2API（--codex）。
+    复用刚注册完已登录的 page（无需像 oauth_codex.py 那样重载 cookie 再登），
+    直接在该窗口打开 SUB2API 生成的授权链接 -> 同意 -> 捕获 localhost:1455 回调 -> 换码建号。
+    带真 refresh_token 的 OAuth 凭据，SUB2API 当 oauth 账号可续期（网页 session 无 rt 会 401）。
+    失败只打印告警，不影响注册成功判定。返回是否成功。"""
+    if not (SUB2API_URL and SUB2API_EMAIL and SUB2API_PASSWORD):
+        print("  [codex] 未配置 SUB2API_URL/EMAIL/PASSWORD（.env），跳过")
+        return False
+    try:
+        from common.uploaders import _origin
+        from common import oauth_codex as ox
+    except Exception as e:
+        print(f"  [codex] 模块加载失败: {str(e)[:120]}")
+        return False
+
+    group = CODEX_GROUP or SUB2API_GROUP
+    origin = _origin(SUB2API_URL)
+    # 注册完页面可能停在 "You're all set / Continue" 欢迎拦层（或各种 onboarding 弹层），
+    # 不清掉就直接开授权，auth_url 会被拦/重定向，drive_authorize 在循环里卡死。
+    # 先尽力点掉 Continue、并导航到干净首页，给 OAuth 一个干净起点。
+    try:
+        for lbl in ["Continue", "続行", "继续", "繼續", "Okay, let's go", "Get started", "Done", "完成"]:
+            try:
+                b = page.get_by_role("button", name=lbl, exact=False)
+                if await b.count() > 0 and await b.first.is_visible():
+                    await b.first.click(timeout=2500)
+                    print(f"  [codex] 关注册后拦层: {lbl}")
+                    await asyncio.sleep(1.5)
+                    break
+            except Exception:
+                pass
+        await page.goto("https://chatgpt.com/", timeout=30000, wait_until="domcontentloaded")
+        await asyncio.sleep(2)
+    except Exception as e:
+        print(f"  [codex] 清拦层/导航首页异常(忽略): {str(e)[:60]}")
+    # 手动填号给足人操作时间(≥300)；自动接码换号多次(CODEX_ADDPHONE_ATTEMPTS×CODEX_SMS_TIMEOUT)
+    # 可能数分钟，超时按换号预算抬足（过 add-phone 后 drive_authorize 还会再续期捕获窗口）。
+    import os as _os
+    _ph_budget = int(_os.environ.get("CODEX_ADDPHONE_ATTEMPTS", "8")) * int(_os.environ.get("CODEX_SMS_TIMEOUT", "150"))
+    timeout = max(CODEX_TIMEOUT, 300, _ph_budget + 120)
+    # 实测 8/8 新号 OAuth 必弹手机(手机要求绑账号、不绑会话，换会话/重开窗口都省不掉)，
+    # 故默认 0=直接接码最快。老号(养过几天)再授权可能不弹，可设 CODEX_PHONE_SKIP_ATTEMPTS>0 赌免手机。
+    skip_n = int(_os.environ.get("CODEX_PHONE_SKIP_ATTEMPTS", "0") or "0")
+    try:
+        # SUB2API: 登录 + 找 openai 分组（PKCE/换码由 SUB2API 包办）
+        token = ox.sub2api_login(origin, SUB2API_EMAIL, SUB2API_PASSWORD)
+        group_id = ox.find_group_id(origin, token, group)
+        print(f"  [codex] SUB2API: group={group}(#{group_id})，免手机直连先试 {skip_n} 次，弹手机才接码")
+
+        # 每次尝试关窗口重开+重登(cookie)，确保是 OpenAI 眼里全新会话(同窗口重发 auth_url
+        # 不改变其"要不要手机"的风控决定)。需 p(playwright) + ctx(导出 cookie)。
+        reset_fn = None
+        if p is not None and ctx is not None and skip_n > 0:
+            try:
+                cookies = await ctx.cookies()
+                reset_fn = ox.make_reset_page(p, cookies, account_email=email)
+            except Exception as e:
+                print(f"  [codex] 构造窗口重置器失败(退化为复用窗口): {str(e)[:60]}")
+                reset_fn = None
+
+        # 驱动授权（先免手机 N 次，最后一次放开手机），捕获 localhost:1455 回调
+        code, session_id, cb_state, msg = await ox.authorize_with_retry(
+            page, lambda: ox.generate_auth_url(origin, token),
+            account_email=email, phone_skip_attempts=skip_n,
+            skip_timeout=120, phone_timeout=timeout, manual_phone=CODEX_MANUAL_PHONE,
+            reset_page=reset_fn)
+        if reset_fn is not None:
+            try:
+                await reset_fn.cleanup()
+            except Exception:
+                pass
+        if not code:
+            print(f"  [codex] 授权未完成: {msg}")
+            return False
+
+        # 换码 + 建 oauth 账号（带 refresh_token）
+        exch = ox.exchange_code(origin, token, session_id, code, cb_state)
+        cred = ox.build_oauth_credentials(exch)
+        print(f"  [codex] exchange-code OK: refresh_token={'YES' if cred.get('refresh_token') else 'NO'} "
+              f"plan={cred.get('plan_type')}")
+        acct = ox.create_oauth_account(origin, token, cred, [group_id],
+                                       name=cred.get("email") or email)
+        acct_id = (acct or {}).get("id")
+        print(f"  [codex] [OK] SUB2API 账号已创建 #{acct_id}（type=oauth，带 refresh_token）✅")
+
+        # 同一份带真 rt 的凭据顺手推到 CPA（best-effort）
+        if CPA_URL and CPA_MGMT_KEY:
+            try:
+                from common.session_export import build_cpa_codex_json_from_oauth
+                from common.uploaders import upload_cpa
+                cpa = build_cpa_codex_json_from_oauth(cred, email=cred.get("email") or email)
+                cok, cmsg = upload_cpa(CPA_URL, CPA_MGMT_KEY, cpa["auth_json"], cpa["file_name"])
+                print(f"  [codex][CPA] {'OK' if cok else 'FAIL'} {cpa['file_name']} - {cmsg}")
+            except Exception as e:
+                print(f"  [codex][CPA] 推送异常: {str(e)[:80]}")
+        return True
+    except Exception as e:
+        print(f"  [codex] 提取失败: {str(e)[:120]}")
+        return False
+
+
 async def register_one(index, total, p):
     start = time.time()
 
@@ -264,6 +472,44 @@ async def register_one(index, total, p):
             return None
         await asyncio.sleep(5)
         await dump_state(page, "after-load")
+
+        # Step 1.2: CF 全页拦截处理。先尝试点 Turnstile 勾选框(临界 IP 上有可点框，点了能过)，
+        # 点几次仍不放行(AWS 等死锁转圈)再换 CF 友好节点重载。两手都试，覆盖不同 IP 信誉档。
+        async def _try_pass_turnstile(rounds=4, wait=4):
+            for _ in range(rounds):
+                if not await _is_cf_blocked(page):
+                    return True
+                await _click_turnstile(page)
+                await asyncio.sleep(wait)
+            return not await _is_cf_blocked(page)
+
+        if await _is_cf_blocked(page):
+            print("  [cf] 检测到 Cloudflare 拦截，先尝试点 Turnstile 勾选框...")
+            if await _try_pass_turnstile():
+                print("  [cf] Turnstile 点击后放行 ✅")
+            else:
+                # 点不动/死锁 -> 轮换 CF 友好节点重载，每个节点再试点一次
+                passed = False
+                for cf_try in range(len(CF_NODES)):
+                    node = _switch_cf_node()
+                    print(f"  [cf] 点击未过，切节点 -> {node or '失败'} 重载({cf_try+1}/{len(CF_NODES)})...")
+                    if not node:
+                        break
+                    await asyncio.sleep(3)
+                    try:
+                        await page.goto(SIGNUP_URL, timeout=60000, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(5)
+                    if await _try_pass_turnstile(rounds=2):
+                        print(f"  [cf] 节点 {node} 放行 ✅")
+                        passed = True
+                        break
+                if not passed:
+                    print("  [cf] 点击+换遍节点仍被拦，放弃本号")
+                    await dump_state(page, "cf-blocked")
+                    email_pool.mark_error(PLATFORM, email, email_pw, "cf_blocked")
+                    return None
 
         # Step 1.5: 先关 cookie 同意横幅（弹出时会挡住/抢焦点，导致邮箱填不进去 -> "邮箱必填"）
         await dismiss_cookie_banner(page)
@@ -363,49 +609,93 @@ async def register_one(index, total, p):
         # ChatGPT 通常发 6 位验证码或确认链接
         code_input = page.locator('input[inputmode="numeric"], input[name="code"], input[autocomplete="one-time-code"], input[type="text"]')
         if await code_input.count() > 0 or "verify" in page.url.lower() or "check" in (await page.locator("body").inner_text()).lower():
-            print("  [4] waiting for email verification code...")
-            # 先试 Graph API(token)；token 多已过期，失败则浏览器登录 Outlook 取信
-            code = await asyncio.get_event_loop().run_in_executor(
-                None, get_code_by_token, email, refresh_token, client_id or None,
-                OAI_SENDER, OAI_SUBJECT, r"\b(\d{6})\b", 40, 5
-            )
-            if not code and email_pw:
-                # 复用 Step 2.5 预登录好的独立窗口（已在收件箱），skip_login 直接轮询取码；
-                # 预登录失败/没开成则另开独立窗口走完整登录兜底（绝不用注册 ctx，避免干扰）。
-                reuse = prelogged and mail_page is not None
-                if reuse:
-                    print("  [4] token failed, polling pre-logged Outlook inbox...")
+            code_sel = 'input[inputmode="numeric"], input[name="code"], input[autocomplete="one-time-code"], input[type="text"]'
+
+            async def _fetch_email_code():
+                """取一次码：先 Graph token，失败再浏览器登录 Outlook 取信。复用/重开独立取码窗口。"""
+                nonlocal mail_bb, mail_pid, mail_page
+                c = await asyncio.get_event_loop().run_in_executor(
+                    None, get_code_by_token, email, refresh_token, client_id or None,
+                    OAI_SENDER, OAI_SUBJECT, r"\b(\d{6})\b", 40, 5
+                )
+                if not c and email_pw:
+                    reuse = prelogged and mail_page is not None
+                    if reuse:
+                        print("  [4] token failed, polling pre-logged Outlook inbox...")
+                    else:
+                        print("  [4] token failed, opening Outlook window to get code...")
+                        try:
+                            mail_bb, mail_pid, _mb, _mctx, mail_page = await open_and_connect(
+                                name=f"mail_{time.strftime('%m%d_%H%M%S')}_{index}", p=p)
+                        except Exception as e:
+                            print(f"  [4] open mail window failed: {str(e)[:60]}")
+                            mail_page = None
+                    if mail_page is not None:
+                        try:
+                            c = await get_code_outlook_pw(
+                                mail_page, email, email_pw,
+                                sender_hint=("openai", "noreply", "no-reply"),
+                                subject_hint=("code", "verify", "openai", "chatgpt", "验证"),
+                                code_regex=r"\b(\d{6})\b", max_wait=150, poll=8,
+                                skip_login=reuse,
+                            )
+                        finally:
+                            if mail_bb and mail_pid:
+                                try:
+                                    await teardown(mail_bb, mail_pid, delete=True)
+                                except Exception:
+                                    pass
+                            mail_bb = mail_pid = mail_page = None
+                    await page.bring_to_front()
+                return c
+
+            async def _renavigate_resend():
+                """收不到码且页面无 Resend：回退 signup 重输邮箱重新发码（用户建议的兜底）。"""
+                print("  [4] 回退 ChatGPT signup，重输邮箱重新发码...")
+                try:
+                    await page.goto(SIGNUP_URL, timeout=60000, wait_until="domcontentloaded")
+                    await asyncio.sleep(4)
+                    await dismiss_cookie_banner(page)
+                    ei = page.locator('input[type="email"], input[name="email"]').first
+                    if await ei.count() == 0:
+                        print("  [4] 回退后无邮箱框，放弃重发")
+                        return
+                    await fill_email_verified(page, ei, email)
+                    await dismiss_cookie_banner(page)
+                    if not await click_any_exact(page, ["Continue", "続行", "继续", "繼續", "Next", "下一步", "Teruskan"]):
+                        sub = page.locator('button[type="submit"]')
+                        if await sub.count() > 0:
+                            await sub.first.click()
+                    await asyncio.sleep(5)
+                    # 可能落到密码页（已注册一半），填密码推进回验证码页
+                    pw = page.locator('input[type="password"]')
+                    if await pw.count() > 0:
+                        await human_type(page, 'input[type="password"]', password)
+                        await asyncio.sleep(1)
+                        if not await click_exact(page, "Continue"):
+                            sub = page.locator('button[type="submit"]')
+                            if await sub.count() > 0:
+                                await sub.first.click()
+                        await asyncio.sleep(4)
+                except Exception as e:
+                    print(f"  [4] 回退重发异常: {str(e)[:80]}")
+
+            code = None
+            for code_try in range(3):
+                if code_try == 0:
+                    print("  [4] waiting for email verification code...")
                 else:
-                    print("  [4] token failed, opening Outlook window to get code...")
-                    try:
-                        mail_bb, mail_pid, _mb, _mctx, mail_page = await open_and_connect(
-                            name=f"mail_{time.strftime('%m%d_%H%M%S')}_{index}", p=p)
-                    except Exception as e:
-                        print(f"  [4] open mail window failed: {str(e)[:60]}")
-                        mail_page = None
-                if mail_page is not None:
-                    try:
-                        code = await get_code_outlook_pw(
-                            mail_page, email, email_pw,
-                            sender_hint=("openai", "noreply", "no-reply"),
-                            subject_hint=("code", "verify", "openai", "chatgpt", "验证"),
-                            code_regex=r"\b(\d{6})\b", max_wait=150, poll=8,
-                            skip_login=reuse,
-                        )
-                    finally:
-                        # 关掉独立取码窗口（teardown 删 BitBrowser profile）
-                        if mail_bb and mail_pid:
-                            try:
-                                await teardown(mail_bb, mail_pid, delete=True)
-                            except Exception:
-                                pass
-                        mail_bb = mail_pid = mail_page = None
-                # 切回注册标签
-                await page.bring_to_front()
+                    print(f"  [4] 收不到码，重试 {code_try}/2：先点 Resend，没有则回退重输邮箱...")
+                    if not await _click_resend_code(page):
+                        await _renavigate_resend()
+                    await asyncio.sleep(2)
+                code = await _fetch_email_code()
+                if code:
+                    break
+
             if code:
                 print(f"  got code: {code}")
                 await dismiss_cookie_banner(page)
-                code_sel = 'input[inputmode="numeric"], input[name="code"], input[autocomplete="one-time-code"], input[type="text"]'
                 ci = page.locator(code_sel).first
                 # 填码（React 受控输入：键盘逐字+JS setter 兜底；fill 不触发 onChange 会停在验证页）
                 if not await react_fill(page, code_sel, code, tries=3):
@@ -472,6 +762,13 @@ async def register_one(index, total, p):
         # 即时导入 chatgpt2api（--import-c2a；用刚抓到的 session 直接 POST，单号失败不影响注册成功）
         if IMPORT_C2A:
             import_chatgpt2api(sess, email)
+
+        # 顺手走 Codex OAuth 提取 rt 导入 SUB2API（--codex；复用已登录窗口，失败不影响注册成功）
+        if EXTRACT_CODEX:
+            try:
+                await extract_codex(page, email, p=p, ctx=ctx)
+            except Exception as e:
+                print(f"  [codex] 异常: {str(e)[:120]}")
 
         if key_val:
             email_pool.mark_used(PLATFORM, email, email_pw)
@@ -789,10 +1086,19 @@ async def main():
                         help="注册成功后即时把 token 导入 chatgpt2api (POST <host>/api/accounts)")
     parser.add_argument("--c2a-url", default=None, help="chatgpt2api host (默认取 config.CHATGPT2API_URL)")
     parser.add_argument("--c2a-key", default=None, help="chatgpt2api admin key (默认取 config.CHATGPT2API_KEY)")
+    parser.add_argument("--codex", action="store_true",
+                        help="注册成功后顺手走 Codex OAuth 提取 refresh_token 导入 SUB2API (oauth 账号可续期)")
+    parser.add_argument("--codex-group", default=None,
+                        help="SUB2API 目标分组名 (默认取 config.SUB2API_GROUP)")
+    parser.add_argument("--codex-manual-phone", action="store_true",
+                        help="Codex add-phone 手动模式: 不接码, 自己在浏览器填号收码")
+    parser.add_argument("--codex-timeout", type=int, default=120,
+                        help="Codex 授权捕获超时秒 (手动填号会自动抬到至少 300)")
     args = parser.parse_args()
 
     global REGISTER_TIMEOUT, KEEP_ON_FAIL, FIXED_EMAIL, FIXED_PASSWORD, FIXED_REFRESH_TOKEN, FIXED_CLIENT_ID
     global IMPORT_C2A, C2A_URL, C2A_KEY
+    global EXTRACT_CODEX, CODEX_GROUP, CODEX_MANUAL_PHONE, CODEX_TIMEOUT
     REGISTER_TIMEOUT = args.timeout
     KEEP_ON_FAIL = args.keep_on_fail
     FIXED_EMAIL = args.email
@@ -802,9 +1108,16 @@ async def main():
     IMPORT_C2A = args.import_c2a
     C2A_URL = args.c2a_url
     C2A_KEY = args.c2a_key
+    EXTRACT_CODEX = args.codex
+    CODEX_GROUP = args.codex_group
+    CODEX_MANUAL_PHONE = args.codex_manual_phone
+    CODEX_TIMEOUT = args.codex_timeout
 
     if IMPORT_C2A and not ((C2A_URL or CHATGPT2API_URL) and (C2A_KEY or CHATGPT2API_KEY)):
         print("  [c2a][WARN] 已开 --import-c2a 但未配置 CHATGPT2API_URL/KEY（--c2a-url/--c2a-key 或 .env），导入会被跳过")
+
+    if EXTRACT_CODEX and not (SUB2API_URL and SUB2API_EMAIL and SUB2API_PASSWORD):
+        print("  [codex][WARN] 已开 --codex 但未配置 SUB2API_URL/EMAIL/PASSWORD（.env），Codex 提取会被跳过")
 
     print("=" * 50)
     print(f"  ChatGPT Auto Register  count={args.count} concurrency={args.concurrency}")

@@ -61,13 +61,20 @@ async def main():
     parser.add_argument("--timeout", type=int, default=120, help="授权捕获超时秒")
     parser.add_argument("--manual-phone", action="store_true",
                         help="add-phone 手动模式:不接码,自己在浏览器填号+输码(如 WhatsApp 码)")
+    parser.add_argument("--phone", default="",
+                        help="add-phone 半自动:脚本填该号(E.164,如 +8618001623966)+选 WhatsApp+发送,你只手输码")
+    parser.add_argument("--phone-skip", type=int, default=0,
+                        help="先赌免手机直连的次数(默认0=直接接码)：每次关窗重开+重登重摇风控，弹手机就跳过；用尽才接码。实测新号必弹手机，老号可设>0 试")
     parser.add_argument("--skip-cpa", action="store_true",
                         help="不把 OAuth 凭据推到 CPA(默认 CPA 配好就推,带真 refresh_token)")
     parser.add_argument("--keep", action="store_true", help="失败保留窗口")
     args = parser.parse_args()
 
-    # 手动填号收码需要人操作时间，超时给足
-    timeout = max(args.timeout, 300) if args.manual_phone else args.timeout
+    # 手动/半自动填号收码需要人操作时间；自动接码换号多次(CODEX_ADDPHONE_ATTEMPTS×CODEX_SMS_TIMEOUT)
+    # 也可能耗时数分钟，超时给足，避免 add-phone 还在换号就被授权捕获超时打断。
+    import os as _os
+    _ph_budget = int(_os.environ.get("CODEX_ADDPHONE_ATTEMPTS", "8")) * int(_os.environ.get("CODEX_SMS_TIMEOUT", "150"))
+    timeout = max(args.timeout, 300, _ph_budget + 120)
 
     if not (SUB2API_URL and SUB2API_EMAIL and SUB2API_PASSWORD):
         print("  [FAIL] SUB2API 未配置(.env: SUB2API_URL/EMAIL/PASSWORD)")
@@ -114,25 +121,34 @@ async def main():
             if plan != "plus":
                 print(f"  [WARN] 当前 planType={plan}，非 plus —— OAuth 能成但可能无 codex 额度")
 
-            # SUB2API: 登录 + 找分组 + 生成授权链接
+            # SUB2API: 登录 + 找分组
             token = ox.sub2api_login(origin, SUB2API_EMAIL, SUB2API_PASSWORD)
             group_id = ox.find_group_id(origin, token, args.group)
-            auth_url, session_id, state = ox.generate_auth_url(origin, token)
-            print(f"  SUB2API: group={args.group}(#{group_id}) session_id={session_id[:12]}...")
+            print(f"  SUB2API: group={args.group}(#{group_id})")
 
-            # 浏览器驱动授权
-            print(f"  打开授权页，捕获回调(上限 {timeout}s){'，add-phone 手动模式' if args.manual_phone else ''}...")
-            code, cb_state, msg = await ox.drive_authorize(page, auth_url, timeout=timeout,
-                                                           debug_dump="oauth_authorize_dump.html",
-                                                           account_email=email,
-                                                           manual_phone=args.manual_phone)
+            # 浏览器驱动授权：先免手机直连 N 次(每次关窗重开+重登=全新会话重摇风控)，弹手机才在最后一次接码/手动
+            _mode = "，add-phone 半自动(填号+选WhatsApp+发送)" if args.phone else ("，add-phone 手动模式" if args.manual_phone else "")
+            print(f"  打开授权页，免手机直连先试 {args.phone_skip}次{_mode}...")
+            reset_fn = ox.make_reset_page(p, cookies, account_email=email) if args.phone_skip > 0 else None
+            code, session_id, cb_state, msg = await ox.authorize_with_retry(
+                page, lambda: ox.generate_auth_url(origin, token),
+                account_email=email, phone_skip_attempts=args.phone_skip,
+                skip_timeout=120, phone_timeout=timeout,
+                debug_dump="oauth_authorize_dump.html",
+                manual_phone=args.manual_phone, semi_phone=args.phone,
+                reset_page=reset_fn)
+            if reset_fn is not None:
+                try:
+                    await reset_fn.cleanup()
+                except Exception:
+                    pass
             if not code:
                 print(f"  [FAIL] 授权未完成: {msg}")
                 return
-            print(f"  捕获回调: code={code[:10]}... state匹配={cb_state==state}")
+            print(f"  捕获回调: code={code[:10]}...")
 
             # 换码 + 建号
-            exch = ox.exchange_code(origin, token, session_id, code, cb_state or state)
+            exch = ox.exchange_code(origin, token, session_id, code, cb_state)
             cred = ox.build_oauth_credentials(exch)
             print(f"  exchange-code OK: refresh_token={'YES' if cred.get('refresh_token') else 'NO'} "
                   f"plan={cred.get('plan_type')} email={cred.get('email')}")

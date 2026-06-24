@@ -135,11 +135,6 @@ CHATGPT2API_URL = _env("CHATGPT2API_URL", "")  # 对端 host（见 .env）
 CHATGPT2API_KEY = _env("CHATGPT2API_KEY", "")  # 对端 admin key（Authorization: Bearer）
 
 # ---------------------------------------------------------------- 订阅授权入口
-# Codex / ChatGPT Plus：baxigpt.com（卡密 + 账号 access_token → 开通 Plus）
-BAXI_API = _env("BAXI_API", "https://baxigpt.com")
-# 卡密池：一个或多个 BX-XXXXXXXX，逗号/换行/空格分隔，方便批量
-BAXI_CARDS = [c.strip().upper() for c in _env("BAXI_CARDS", "").replace("\n", ",").replace(" ", ",").split(",") if c.strip()]
-
 # Claude / SuperGrok 订阅入口（激活码 CDK 流程「敬请期待」，后续支持授权到 SUB2API / CPA）
 CLAUDE_SUB_URL = _env("CLAUDE_SUB_URL", "https://6661231.xyz/#/claude")
 GROK_SUB_URL = _env("GROK_SUB_URL", "https://6661231.xyz/#/grok")
@@ -155,3 +150,12 @@ HERO_SMS_SERVICE_OPENAI = _env("HERO_SMS_SERVICE_OPENAI", "dr")  # hero-sms/sms-
 SMS_MAXPRICE_OPENAI = _env("SMS_MAXPRICE_OPENAI", "20")
 # OpenAI add-phone 拉黑的号段(dialing code)：261 马达加斯加、63 菲律宾 等 OpenAI 常拒的
 SMS_COUNTRY_BLACKLIST_OPENAI = [c.strip() for c in _env("SMS_COUNTRY_BLACKLIST_OPENAI", "261,63").split(",") if c.strip()]
+
+# ---------------------------------------------------------------- 接码平台 (sms-man.com)
+# sms-man.com API v2.0：base/control，token 鉴权，JSON 响应。过 Codex add-phone 主用。
+# 返回的 number 已含国家码。app_id 支持数字 application_id 或 code/名(运行时查 /applications 解析)。
+SMSMAN_API_BASE = _env("SMSMAN_API_BASE", "https://api.sms-man.com/control")
+SMSMAN_TOKEN = _env("SMSMAN_TOKEN", "")  # sms-man.com API key（profile 页获取）
+SMSMAN_APP_ID_OPENAI = _env("SMSMAN_APP_ID_OPENAI", "openai")  # 数字 application_id 或 code/名(自动解析)
+SMSMAN_COUNTRY_ID_OPENAI = _env("SMSMAN_COUNTRY_ID_OPENAI", "0")  # 0=随机国家
+SMSMAN_MAXPRICE_OPENAI = _env("SMSMAN_MAXPRICE_OPENAI", "")  # 价格上限（sms-man 币种），空=不限

@@ -62,6 +62,12 @@ def build_command(platform, args, account):
             cmd.append("--keep-on-fail")
         if getattr(args, "import_c2a", False):
             cmd.append("--import-c2a")  # 注册成功后即时导入 chatgpt2api
+        if getattr(args, "codex", False):
+            cmd.append("--codex")  # 注册成功后走 Codex OAuth 提取 rt 导入 SUB2API
+            if getattr(args, "codex_group", None):
+                cmd += ["--codex-group", args.codex_group]
+            if getattr(args, "codex_manual_phone", False):
+                cmd.append("--codex-manual-phone")
         return cmd
 
     if platform == "grok":
@@ -192,6 +198,12 @@ async def main():
     parser.add_argument("--keep-on-fail", action="store_true")
     parser.add_argument("--import-c2a", action="store_true",
                         help="chatgpt 注册成功后即时把 token 导入 chatgpt2api（透传给 register_chatgpt.py）")
+    parser.add_argument("--codex", action="store_true",
+                        help="chatgpt 注册成功后走 Codex OAuth 提取 rt 导入 SUB2API（透传给 register_chatgpt.py）")
+    parser.add_argument("--codex-group", default=None,
+                        help="SUB2API 目标分组名（透传给 register_chatgpt.py，默认取 config.SUB2API_GROUP）")
+    parser.add_argument("--codex-manual-phone", action="store_true",
+                        help="Codex add-phone 手动模式（透传给 register_chatgpt.py）")
     # broker + loop
     parser.add_argument("--broker", default="http://127.0.0.1:8765", help="共享取码服务 URL；传空串 '' 禁用")
     parser.add_argument("--grok-timeout", type=int, default=40, help="Grok 取码 broker 超时(秒，outlook 注定超时故调短)")

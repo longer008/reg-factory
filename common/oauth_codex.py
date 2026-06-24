@@ -139,8 +139,34 @@ async def _has_phone_error(page):
     return False
 
 
+async def _select_sms_if_present(page):
+    """add-phone「コードの受け取り方法」可能有 WhatsApp / SMS 切换，默认常选中 WhatsApp。
+    接码平台(sms-man/firefox)发的是 **SMS**，必须切到 SMS 否则码发去 WhatsApp、脚本永远收不到。
+    尽力点选 SMS（按文案/role 多策略），点不到返回 False（不报错）。"""
+    labels = ["SMS", "Text message", "Text", "テキスト", "ショートメッセージ", "短信", "簡訊", "簡訊/短信"]
+    for lbl in labels:
+        for getter in (
+            lambda l=lbl: page.get_by_role("radio", name=l, exact=False),
+            lambda l=lbl: page.get_by_role("button", name=l, exact=False),
+            lambda l=lbl: page.get_by_role("tab", name=l, exact=False),
+            lambda l=lbl: page.locator(f'button:has-text("{l}")'),
+            lambda l=lbl: page.locator(f'label:has-text("{l}")'),
+            lambda l=lbl: page.get_by_text(l, exact=True),
+        ):
+            try:
+                loc = getter()
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=3000)
+                    await asyncio.sleep(0.6)
+                    print(f"  [add-phone] 已选 SMS（匹配 '{lbl}'）")
+                    return True
+            except Exception:
+                pass
+    return False
+
+
 async def _fill_phone_continue(page, country_code, national):
-    """填手机号(优先整条 E.164，react-aria 多数会自动识别国家)并点 Continue。"""
+    """填手机号(优先整条 E.164，react-aria 多数会自动识别国家)，选 SMS 发码方式，再点 Continue。"""
     full = ("+" + country_code + national) if country_code else ("+" + national)
     tel = page.locator("#tel")
     await tel.wait_for(state="visible", timeout=15000)
@@ -151,8 +177,61 @@ async def _fill_phone_continue(page, country_code, national):
         pass
     await tel.type(full, delay=25)
     await asyncio.sleep(1.0)
+    # 关键：接码平台发的是 SMS，必须把发码方式从默认 WhatsApp 切到 SMS（同页 toggle）
+    await _select_sms_if_present(page)
     btn = page.locator('button[data-dd-action-name="Continue"], button[type="submit"]')
     await btn.first.click(timeout=6000)
+    await asyncio.sleep(2.0)
+    # 提交后若弹出独立的发码方式选择页，再切一次 SMS
+    await _select_sms_if_present(page)
+
+
+async def _select_whatsapp_if_present(page):
+    """add-phone 填号后可能出现"短信/WhatsApp"发码方式选择。尽力点选 WhatsApp（按文案/role
+    多策略匹配），点不到就返回 False（不报错，留给调用方决定）。"""
+    labels = ["WhatsApp", "Whatsapp", "whatsapp", "通过 WhatsApp", "用 WhatsApp"]
+    for lbl in labels:
+        for getter in (
+            lambda l=lbl: page.get_by_role("radio", name=l, exact=False),
+            lambda l=lbl: page.get_by_role("button", name=l, exact=False),
+            lambda l=lbl: page.get_by_text(l, exact=False),
+            lambda l=lbl: page.locator(f'label:has-text("{l}")'),
+        ):
+            try:
+                loc = getter()
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=3000)
+                    await asyncio.sleep(0.8)
+                    print(f"  [add-phone] 已选 WhatsApp（匹配 '{lbl}'）")
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+async def _semi_fill_phone(page, full_e164):
+    """半自动：填整条 E.164 号 → 选 WhatsApp（若有选项）→ 点发送/Continue。
+    成功推进返回 True。任何关键步骤异常返回 False，并由调用方 dump 页面+转手动。"""
+    tel = page.locator("#tel")
+    await tel.wait_for(state="visible", timeout=15000)
+    await tel.click()
+    try:
+        await tel.fill("")
+    except Exception:
+        pass
+    await tel.type(full_e164, delay=25)
+    await asyncio.sleep(0.8)
+    # 先尝试在填号页就地选 WhatsApp（有些版本是同页 radio）
+    await _select_whatsapp_if_present(page)
+    # 点 Continue/发送
+    btn = page.locator('button[data-dd-action-name="Continue"], button[type="submit"]')
+    if await btn.count() == 0 or not await btn.first.is_visible():
+        return False
+    await btn.first.click(timeout=6000)
+    await asyncio.sleep(2.0)
+    # 提交后可能弹出发码方式选择页，再试一次 WhatsApp
+    await _select_whatsapp_if_present(page)
+    return True
 
 
 async def _enter_otp(page, code):
@@ -223,16 +302,26 @@ async def _goto_add_phone(page, auth_url, account_email, timeout=45):
     return False
 
 
-async def handle_add_phone(page, auth_url="", account_email="", attempts=5, sms_timeout=180):
+async def handle_add_phone(page, auth_url="", account_email="", attempts=None, sms_timeout=None):
     """auth.openai.com/add-phone:接码平台租号→填→收码→提交，被拒/收不到码就**回退页面**换号重试。
     成功(离开 add-phone)返回 True。
 
-    ⚠️ WIP：自动接码路径未充分验证（OpenAI 对普通虚拟号风控严，SMS_PROJECT_ID_OPENAI 默认空）。
-    当前推荐用 oauth_codex.py --manual-phone 手动填号 + 输 WhatsApp 码；全自动接码版后续完善。
+    接码 provider 顺序：sms-man.com 优先(配 SMSMAN_TOKEN 即启用，SMS 直收，匹配本函数
+    自动填号→输码路径) → firefox.fun → hero-sms。未配 sms-man 时仅走后两者，OpenAI 对普通
+    虚拟号风控严，命中率低，可改用 --codex-manual-phone 手动填号收码。
+    换号次数/单号等码超时可经环境变量调：CODEX_ADDPHONE_ATTEMPTS(默认8)、CODEX_SMS_TIMEOUT(默认150)。
+    OpenAI 对虚拟号拒收率高，给足换号次数才摸得到能用的号。
     """
+    import os as _os
+    if attempts is None:
+        attempts = int(_os.environ.get("CODEX_ADDPHONE_ATTEMPTS", "8") or "8")
+    if sms_timeout is None:
+        sms_timeout = int(_os.environ.get("CODEX_SMS_TIMEOUT", "150") or "150")
     from common import sms
     from config import (SMS_PROJECT_ID_OPENAI, HERO_SMS_SERVICE_OPENAI,
-                        SMS_MAXPRICE_OPENAI, SMS_COUNTRY_BLACKLIST_OPENAI)
+                        SMS_MAXPRICE_OPENAI, SMS_COUNTRY_BLACKLIST_OPENAI,
+                        SMSMAN_APP_ID_OPENAI, SMSMAN_COUNTRY_ID_OPENAI, SMSMAN_MAXPRICE_OPENAI)
+    print(f"  [add-phone] 接码模式：最多换号 {attempts} 次，单号等码 {sms_timeout}s")
     for i in range(attempts):
         pkey = None
         try:
@@ -255,10 +344,17 @@ async def handle_add_phone(page, auth_url="", account_email="", attempts=5, sms_
                     print("  [add-phone] 回退后仍找不到 #tel，跳过本次")
                     continue
 
-            # 任意国家(库存动态，指定具体国家常无货) + 拉黑垃圾号段 + 给够价格上限
+            # 任意国家(库存动态，指定具体国家常无货) + 拉黑垃圾号段 + 给够价格上限。
+            # max_retries 经 SMS_GETPHONE_RETRIES 可调：OpenAI WhatsApp 项目(1096/1008)库存
+            # 常成分钟级干涸，默认 4 次(~32s)轮询太短，调大让本步骤耐心等补货。
+            import os as _os
+            _retries = int(_os.environ.get("SMS_GETPHONE_RETRIES", "4") or "4")
             phone, cc, pkey = sms.get_phone(SMS_PROJECT_ID_OPENAI, HERO_SMS_SERVICE_OPENAI,
                                             country_prefer=[""], country_blacklist=SMS_COUNTRY_BLACKLIST_OPENAI,
-                                            max_retries=4, max_price=SMS_MAXPRICE_OPENAI)
+                                            max_retries=_retries, max_price=SMS_MAXPRICE_OPENAI,
+                                            smsman_app=SMSMAN_APP_ID_OPENAI,
+                                            smsman_country=SMSMAN_COUNTRY_ID_OPENAI,
+                                            smsman_maxprice=SMSMAN_MAXPRICE_OPENAI)
             print(f"  [add-phone] 尝试 {i+1}/{attempts}: +{cc}{phone}")
             await _fill_phone_continue(page, cc, phone)
             await asyncio.sleep(4)
@@ -311,12 +407,16 @@ async def _click_account(page, account_email=""):
     return False
 
 
-async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_email="", manual_phone=False):
+async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_email="", manual_phone=False, semi_phone="", allow_phone=True):
     """在已登录该账号的页面打开 auth_url，处理账号选择/同意页，捕获 localhost:1455 回调。
     manual_phone=True 时遇到 add-phone 不自动接码，由用户在浏览器手动填号收码，脚本轮询等待。
+    semi_phone 非空时(半自动)：脚本自动填该号+选 WhatsApp+发送一次，然后转手动等用户输码。
+    allow_phone=False 时遇到 add-phone **立即返回**(不接码不花钱)，msg="ADDPHONE_REQUIRED"，
+    供上层"先试 N 次免手机直连、实在每次都弹才在最后一次接码"的策略复用。
     返回 (code, state, msg)。失败 code/state 为 None。"""
     captured = {}
     manual_hint_shown = False
+    semi_sent = False
 
     async def _handle(route):
         captured["url"] = route.request.url
@@ -338,6 +438,7 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
             pass  # 可能被重定向到 localhost 打断，正常
 
         deadline = time.time() + timeout
+        consent_url_seen = [0]  # 连续在 consent 页未推进的轮数，多了就 re-goto 破 churn
         while time.time() < deadline:
             if captured.get("url"):
                 break
@@ -353,6 +454,26 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
             # 脚本只轮询等待离开 add-phone 页；否则走接码自动过。
             try:
                 if "add-phone" in page.url or "/phone" in page.url:
+                    if not allow_phone:
+                        # 本次只赌"免手机直连"，弹了手机就立刻退出(不接码不花钱)，交给上层换会话重试
+                        print("  [add-phone] 本次免手机策略：检测到要手机验证，跳过本次(不接码)")
+                        return None, None, "ADDPHONE_REQUIRED"
+                    if semi_phone:
+                        # 半自动：第一次到 add-phone 页就填号+选 WhatsApp+发送，之后转轮询等用户输码。
+                        if not semi_sent:
+                            print(f"  [add-phone] 半自动:填号 {semi_phone} + 选 WhatsApp + 发送...")
+                            try:
+                                ok = await _semi_fill_phone(page, semi_phone)
+                            except Exception as e:
+                                ok = False
+                                print(f"  [add-phone] 半自动填号异常: {str(e)[:80]}")
+                            semi_sent = True
+                            if ok:
+                                print("  [add-phone] 已发送。请在浏览器里输入收到的 WhatsApp 验证码；脚本轮询等待离开本页。")
+                            else:
+                                print("  [add-phone] 自动填号/选WhatsApp未完全成功，请在浏览器里手动完成（填号/选WhatsApp/输码）。")
+                        await asyncio.sleep(2.0)
+                        continue
                     if manual_phone:
                         if not manual_hint_shown:
                             print("  [add-phone] 手动模式:请在浏览器里自行填写手机号并输入收到的验证码(如 WhatsApp 码)。")
@@ -363,31 +484,65 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
                     ok = await handle_add_phone(page, auth_url=auth_url, account_email=account_email)
                     if not ok:
                         return None, None, "add-phone 手机验证失败(接码换号都没过)"
+                    # add-phone 自动接码可能耗时数分钟，把原 deadline 吃光。过了之后给
+                    # 后续「同意页→捕获 localhost:1455 回调」一段独立的新预算，否则刚过手机
+                    # 验证就因 deadline 已到而退出、卡在 /codex/consent 拿不到回调。
+                    deadline = max(deadline, time.time() + 90)
+                    print(f"  [add-phone] 通过，续期授权捕获窗口至 +{int(deadline - time.time())}s")
                     await asyncio.sleep(2.0)
                     continue
             except Exception as e:
                 return None, None, f"add-phone 处理异常: {str(e)[:80]}"
-            # 尝试点同意/授权按钮
-            for lbl in CONSENT_LABELS:
+            # 同意页(/codex/consent)：就一个 续行/Continue 提交按钮。优先用精确 selector
+            # (role+name 在 churn 态常 DOMException)，点不到累计；连续多轮没推进就 re-goto 破 churn。
+            clicked = False
+            for sel in ('button[data-dd-action-name="Continue"]', 'button[type="submit"]'):
                 try:
-                    loc = page.get_by_role("button", name=lbl, exact=False)
+                    loc = page.locator(sel)
                     if await loc.count() > 0 and await loc.first.is_visible():
                         await loc.first.click(timeout=2500)
                         await asyncio.sleep(1.5)
+                        clicked = True
                         break
                 except Exception:
                     pass
-            else:
-                # 再试 link 角色
+            if not clicked:
+                for lbl in CONSENT_LABELS:
+                    try:
+                        loc = page.get_by_role("button", name=lbl, exact=False)
+                        if await loc.count() > 0 and await loc.first.is_visible():
+                            await loc.first.click(timeout=2500)
+                            await asyncio.sleep(1.5)
+                            clicked = True
+                            break
+                    except Exception:
+                        pass
+            if not clicked:
                 for lbl in CONSENT_LABELS:
                     try:
                         loc = page.get_by_role("link", name=lbl, exact=False)
                         if await loc.count() > 0 and await loc.first.is_visible():
                             await loc.first.click(timeout=2500)
                             await asyncio.sleep(1.5)
+                            clicked = True
                             break
                     except Exception:
                         pass
+            # churn 破解：在 consent 页连续 4 轮没点动按钮，重新 goto auth_url 拿干净页面
+            try:
+                on_consent = "consent" in page.url or "sign-in-with-chatgpt" in page.url
+            except Exception:
+                on_consent = True
+            if on_consent and not clicked:
+                consent_url_seen[0] += 1
+                if consent_url_seen[0] % 4 == 0:
+                    print(f"  [consent] 连续 {consent_url_seen[0]} 轮未推进，re-goto auth_url 破 churn...")
+                    try:
+                        await page.goto(auth_url, timeout=30000, wait_until="domcontentloaded")
+                    except Exception:
+                        pass
+            else:
+                consent_url_seen[0] = 0
             await asyncio.sleep(1.0)
 
         url = captured.get("url")
@@ -416,3 +571,146 @@ async def drive_authorize(page, auth_url, timeout=120, debug_dump=None, account_
                 await page.context.unroute(pat, _handle)
             except Exception:
                 pass
+
+
+def _sanitize_cookies(cookies):
+    """清洗 cookie 给 add_cookies 用(只留必要字段，sameSite 规范化)。"""
+    out = []
+    for c in cookies:
+        nc = {k: c[k] for k in ("name", "value", "domain", "path", "httpOnly", "secure") if k in c}
+        if isinstance(c.get("expires"), (int, float)) and c["expires"] > 0:
+            nc["expires"] = c["expires"]
+        ss = c.get("sameSite")
+        nc["sameSite"] = ss if ss in ("Strict", "Lax", "None") else "Lax"
+        out.append(nc)
+    return out
+
+
+def make_reset_page(p, cookies, account_email="", name_prefix="codex_retry"):
+    """造一个 reset_page(old_page)->new_page 回调：关旧窗口→开新窗口→灌 cookie→开 chatgpt.com
+    确认登录态。给 authorize_with_retry 用，使每次尝试都是 OpenAI 眼里的全新会话。
+    p: playwright 实例；cookies: 注册窗口导出的 cookie 列表(list[dict])。
+    第一次调用 old_page 是注册窗口——也关掉它(由调用方在 finally 兜底删 profile)。"""
+    from common.browser import open_and_connect, teardown
+    state = {"bb": None, "pid": None}
+    clean = _sanitize_cookies(cookies)
+
+    async def reset_page(old_page):
+        # 关掉上一个 retry 窗口(注册原窗口由调用方 finally 删，这里只删自己开的)
+        if state["bb"] and state["pid"]:
+            try:
+                await teardown(state["bb"], state["pid"], delete=True)
+            except Exception:
+                pass
+            state["bb"] = state["pid"] = None
+        bb, pid, browser, ctx, page = await open_and_connect(
+            name=f"{name_prefix}_{time.strftime('%H%M%S')}", p=p)
+        state["bb"], state["pid"] = bb, pid
+        await ctx.clear_cookies()
+        await ctx.add_cookies(clean)
+        await page.goto("https://chatgpt.com/", timeout=60000, wait_until="domcontentloaded")
+        await asyncio.sleep(3)
+        # 确认登录态(撞导航重试几次)
+        for _ in range(5):
+            try:
+                sess = await page.evaluate(
+                    "() => fetch('/api/auth/session',{credentials:'include'}).then(r=>r.ok?r.json():null).catch(()=>null)")
+                if sess and sess.get("accessToken"):
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(2)
+        return page
+
+    async def cleanup():
+        """收尾删最后一个 retry 窗口(调用方 finally await 调)。"""
+        if state["bb"] and state["pid"]:
+            try:
+                await teardown(state["bb"], state["pid"], delete=True)
+            except Exception:
+                pass
+            state["bb"] = state["pid"] = None
+
+    reset_page.cleanup = cleanup
+    reset_page.state = state
+    return reset_page
+
+
+async def authorize_with_retry(page, gen_auth_url, account_email="", phone_skip_attempts=3,
+                               skip_timeout=120, phone_timeout=600, debug_dump=None,
+                               manual_phone=False, semi_phone="", reset_page=None):
+    """Codex 授权重试编排：**先赌 N 次"免手机直连"，每次失败重新生成授权链接(新会话=重新摇风控骰子)，
+    实在每次都要手机，最后一次才真接码/手动填号。**
+
+    gen_auth_url: 无参可调用，每次返回 (auth_url, session_id, state)，内部重新 POST generate-auth-url。
+    phone_skip_attempts: 免手机尝试次数(默认 3)。这 N 次遇 add-phone 立即跳过(不接码不花钱)。
+    第 N+1 次(最后一次)放开手机：manual_phone/semi_phone 决定接码方式，默认自动接码。
+    reset_page: 可选 async 可调用 reset_page(old_page)->new_page。**每次尝试前关旧窗口、开新窗口、
+      重登(cookie)**，让每次都是 OpenAI 眼里全新会话——这才能真正重摇"要不要手机"的风控
+      (复用同窗口重发 auth_url 不改变其决定)。返回 None 视为重置失败，沿用旧 page。
+    返回 (code, session_id, state, msg)；失败 code 为 None。code 与返回的 session_id/state 必配套。"""
+    last_msg = ""
+    total = max(1, phone_skip_attempts) + 1
+    for attempt in range(total):
+        is_phone_attempt = attempt >= phone_skip_attempts
+        # 每次尝试前关窗口重开+重登，确保是全新会话(否则同窗口重试不改变风控决定)
+        if reset_page is not None:
+            try:
+                new_page = await reset_page(page)
+                if new_page is not None:
+                    page = new_page
+                else:
+                    print(f"  [codex] 第 {attempt+1} 次窗口重置失败，沿用旧窗口")
+            except Exception as e:
+                print(f"  [codex] 窗口重置异常(忽略): {str(e)[:80]}")
+        # 生成授权链接(SUB2API generate-auth-url)。tiantianai.co 经代理偶发抖动，
+        # 单次失败不该搞死整轮——重试几次(退避)，全失败才放弃本次尝试。
+        auth_url = session_id = state = None
+        for _g in range(4):
+            try:
+                auth_url, session_id, state = gen_auth_url()
+                break
+            except Exception as e:
+                last_msg = f"生成授权链接失败: {str(e)[:80]}"
+                print(f"  [codex] gen_auth_url 失败({_g+1}/4): {str(e)[:70]}")
+                await asyncio.sleep(3 + _g * 2)
+        if not auth_url:
+            # 本次尝试拿不到链接：不是最后一次就继续下一次(可能节点恢复)，最后一次才真退
+            if attempt < total - 1:
+                print("  [codex] 本次生成链接失败，下一次重试...")
+                continue
+            return None, None, None, last_msg or "生成授权链接失败"
+        if is_phone_attempt:
+            mode = "手动填号" if manual_phone else ("半自动" if semi_phone else "自动接码")
+            print(f"  [codex] 授权尝试 {attempt+1}/{total}（最后一次，放开手机验证：{mode}，上限 {phone_timeout}s）...")
+            _budget = phone_timeout
+            _coro = drive_authorize(
+                page, auth_url, timeout=phone_timeout, debug_dump=debug_dump,
+                account_email=account_email, manual_phone=manual_phone, semi_phone=semi_phone,
+                allow_phone=True)
+        else:
+            print(f"  [codex] 授权尝试 {attempt+1}/{total}（免手机直连，弹手机就换会话重试，上限 {skip_timeout}s）...")
+            _budget = skip_timeout
+            _coro = drive_authorize(
+                page, auth_url, timeout=skip_timeout, debug_dump=None,
+                account_email=account_email, allow_phone=False)
+        # 硬上限：drive_authorize 内部循环若被卡死的 await 阻塞会无视自身 deadline，
+        # 这里用 wait_for 兜底(+60s 缓冲)强制超时，避免整轮永久冻结。
+        try:
+            code, cb_state, msg = await asyncio.wait_for(_coro, timeout=_budget + 60)
+        except asyncio.TimeoutError:
+            code, cb_state, msg = None, None, f"drive_authorize 硬超时({_budget+60}s)"
+            print(f"  [codex] 第 {attempt+1} 次硬超时，强制中断重试...")
+        last_msg = msg
+        if code:
+            return code, session_id, cb_state or state, "ok"
+        if msg == "ADDPHONE_REQUIRED":
+            print(f"  [codex] 第 {attempt+1} 次要手机验证，换新会话重试...")
+            await asyncio.sleep(1.5)
+            continue
+        # 非"要手机"的其它失败(没捕获回调/error 等)：免手机阶段也继续重试，最后一次失败才退
+        if is_phone_attempt:
+            return None, None, None, msg
+        print(f"  [codex] 第 {attempt+1} 次未成({str(msg)[:50]})，重试...")
+        await asyncio.sleep(1.5)
+    return None, None, None, last_msg or "授权重试用尽"

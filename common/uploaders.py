@@ -11,6 +11,7 @@ common/uploaders.py — 把本地标准 token 上传到下游管理接口。
 """
 
 import json
+import time
 from urllib.parse import urlparse, quote
 
 import requests
@@ -72,8 +73,20 @@ def _sub2api_request(origin, path, token=None, method="GET", body=None, timeout=
     headers = {"Accept": "application/json", "Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    resp = requests.request(method, f"{origin}{path}", headers=headers,
-                            data=None if body is None else json.dumps(body), timeout=timeout)
+    # 出口节点(机房代理)偶发 TLS 抖动(SSLEOFError)/连接重置，单发就失败会白白中断整轮
+    # OAuth(已开浏览器)。对连接类错误小退避重试几次，业务错误(4xx/code!=0)不重试。
+    last_exc = None
+    for attempt in range(4):
+        try:
+            resp = requests.request(method, f"{origin}{path}", headers=headers,
+                                    data=None if body is None else json.dumps(body), timeout=timeout)
+            break
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise
     try:
         payload = resp.json()
     except ValueError:
