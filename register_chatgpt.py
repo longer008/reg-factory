@@ -548,7 +548,12 @@ async def register_one(index, total, p):
         mail_bb = mail_pid = mail_page = None
         prelogged = False
         mail_logged_in = False  # 取码窗口是否已登录(prelogin 成功 或 取码时登过)；跨 resend 复用，别反复关窗重登
-        if email_pw:
+        # 有可用 Graph token 时跳过浏览器预登录：取码首选 Graph API(get_code_by_token)直收，
+        # 不必开浏览器登 Outlook。只有没 token(fresh/空)才预登录走浏览器取码兜底。
+        has_token = bool(refresh_token) and refresh_token.strip().lower() != "fresh"
+        if has_token:
+            print(f"  [2.5] 有 Graph token，跳过浏览器预登录，取码走 Graph API")
+        if email_pw and not has_token:
             try:
                 print("  [2.5] pre-login Outlook (独立窗口) before sending code...")
                 mail_bb, mail_pid, _mb, _mctx, mail_page = await open_and_connect(
